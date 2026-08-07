@@ -10,6 +10,13 @@
 //! toggles for Turso's experimental features (`experimental_encryption`,
 //! `experimental_attach`, etc.) that mirror [`turso::Builder`].
 //!
+//! Cargo features only make capabilities available; which engine a driver
+//! opens is decided at runtime by its configuration. With the `sync`
+//! feature, a driver configured with [`Turso::with_remote_url`] (or any
+//! other sync option, or [`Turso::with_sync`]) opens Turso's sync engine;
+//! an unconfigured driver always opens the plain local engine, feature or
+//! not.
+//!
 //! [toasty-driver-sqlite]: https://docs.rs/toasty-driver-sqlite
 //!
 //! # Examples
@@ -68,10 +75,8 @@ use toasty_core::{
 use toasty_sql::{self as sql};
 use tokio::sync::Mutex;
 #[cfg(feature = "sync")]
-use turso::sync::{AuthTokenFn, Builder, Database};
-#[cfg(not(feature = "sync"))]
-use turso::{Builder, Database};
-use turso::{Connection as TursoConn, Statement, Value as TursoValue};
+use turso::sync::{AuthTokenFn, Builder as SyncBuilder, Database as SyncDatabase};
+use turso::{Builder, Connection as TursoConn, Database, Statement, Value as TursoValue};
 
 enum SqlReturn {
     Count,
@@ -108,21 +113,22 @@ enum TursoPath {
     InMemory,
 }
 
-/// Driver builder options applied when opening a [`turso::Database`].
+/// Driver builder options applied when opening a database.
+///
+/// Local and sync options coexist; which set applies is decided at
+/// [`Turso::database`] time by the driver's mode, not at compile time.
 #[derive(Debug, Default, Clone)]
 struct BuilderOptions {
     index_method: bool,
 
-    #[cfg(not(feature = "sync"))]
     local_options: LocalBuilderOptions,
 
     #[cfg(feature = "sync")]
     sync_options: SyncBuilderOptions,
 }
 
-#[cfg(not(feature = "sync"))]
 impl BuilderOptions {
-    fn apply(&self, mut b: Builder) -> Builder {
+    fn apply_local(&self, mut b: Builder) -> Builder {
         b = self.local_options.apply(b);
         if self.index_method {
             b = b.experimental_index_method(true);
@@ -135,7 +141,6 @@ impl BuilderOptions {
 /// `turso::Builder::experimental_*` method and is applied in
 /// [`LocalBuilderOptions::apply`] when the driver constructs a fresh
 /// [`turso::Builder`] at connection time.
-#[cfg(not(feature = "sync"))]
 #[derive(Debug, Default, Clone)]
 struct LocalBuilderOptions {
     encryption: Option<EncryptionOpts>,
@@ -148,8 +153,21 @@ struct LocalBuilderOptions {
     without_rowid: bool,
 }
 
-#[cfg(not(feature = "sync"))]
 impl LocalBuilderOptions {
+    /// Whether any local-engine option was configured. Used to reject
+    /// configurations that combine local-only options with sync mode.
+    #[cfg(feature = "sync")]
+    fn any_set(&self) -> bool {
+        self.encryption.is_some()
+            || self.attach
+            || self.custom_types
+            || self.generated_columns
+            || self.materialized_views
+            || self.vacuum
+            || self.multiprocess_wal
+            || self.without_rowid
+    }
+
     fn apply(&self, mut b: Builder) -> Builder {
         if let Some(opts) = &self.encryption {
             // Upstream requires *both* the feature flag and the
@@ -248,7 +266,7 @@ impl fmt::Debug for SyncBuilderOptions {
 
 #[cfg(feature = "sync")]
 impl BuilderOptions {
-    fn apply(&self, mut b: Builder) -> Builder {
+    fn apply_sync(&self, mut b: SyncBuilder) -> SyncBuilder {
         if let Some(remote_url) = &self.sync_options.remote_url {
             b = b.with_remote_url(remote_url)
         }
@@ -322,12 +340,28 @@ pub struct Turso {
     path: TursoPath,
     options: BuilderOptions,
     concurrent_writes: bool,
-    /// Shared `turso::Database` reused across every `connect()` call so that
+    /// Whether the driver opens the sync engine instead of the plain
+    /// local one. Set by [`Turso::with_sync`] and implied by the
+    /// mode-selecting sync options (`with_remote_url`, `with_client_name`,
+    /// ...) — but never by credentials.
+    #[cfg(feature = "sync")]
+    sync_mode: bool,
+    /// Shared database handle reused across every `connect()` call so that
     /// all pool slots see the same underlying database. Without this, each
     /// connection to `:memory:` would open a fresh empty database; even
     /// file-backed handles open faster after the first builder run.
     /// Cleared by [`Driver::reset_db`] so the next `connect()` starts fresh.
-    database: Arc<Mutex<Option<Database>>>,
+    database: Arc<Mutex<Option<AnyDatabase>>>,
+}
+
+/// The engine behind a [`Turso`] driver, selected at runtime by the
+/// driver's configuration: the plain local engine, or (with the `sync`
+/// feature) the sync engine that replicates to a remote database.
+#[derive(Clone)]
+enum AnyDatabase {
+    Local(Database),
+    #[cfg(feature = "sync")]
+    Sync(SyncDatabase),
 }
 
 impl Turso {
@@ -368,8 +402,37 @@ impl Turso {
             path,
             options: BuilderOptions::default(),
             concurrent_writes: false,
+            #[cfg(feature = "sync")]
+            sync_mode: false,
             database: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Whether this driver opens the sync engine.
+    fn is_sync(&self) -> bool {
+        #[cfg(feature = "sync")]
+        {
+            self.sync_mode
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            false
+        }
+    }
+
+    /// Open the database with the sync engine even though no sync option
+    /// is set. Mirrors `turso::sync::Builder::new_remote` without a
+    /// remote URL: a file that was previously synced loads its remote URL
+    /// from on-disk metadata.
+    ///
+    /// Every mode-selecting sync option ([`Self::with_remote_url`],
+    /// [`Self::with_client_name`], ...) implies this; it only needs to be
+    /// called explicitly for the metadata-reopen case (credentials such as
+    /// [`Self::with_auth_token`] select nothing by themselves).
+    #[cfg(feature = "sync")]
+    pub fn with_sync(mut self) -> Self {
+        self.sync_mode = true;
+        self
     }
 
     /// Allow transactions to run concurrently instead of serializing on a
@@ -392,9 +455,10 @@ impl Turso {
         self
     }
 
-    /// Enable Turso's experimental index methods. With the `sync` feature,
-    /// mirrors `turso::sync::Builder::experimental_index_method`; otherwise
-    /// mirrors `turso::Builder::experimental_index_method`.
+    /// Enable Turso's experimental index methods. Mirrors
+    /// `turso::Builder::experimental_index_method` (and its
+    /// `turso::sync::Builder` counterpart when the driver is configured
+    /// for sync).
     pub fn experimental_index_method(mut self, on: bool) -> Self {
         self.options.index_method = on;
         self
@@ -404,7 +468,6 @@ impl Turso {
     /// key. Bundles `turso::Builder::experimental_encryption(true)` with
     /// `turso::Builder::with_encryption(opts)` so callers cannot enable
     /// encryption without supplying a key.
-    #[cfg(not(feature = "sync"))]
     pub fn experimental_encryption(mut self, opts: EncryptionOpts) -> Self {
         self.options.local_options.encryption = Some(opts);
         self
@@ -412,7 +475,6 @@ impl Turso {
 
     /// Enable Turso's experimental `ATTACH DATABASE` support. Mirrors
     /// `turso::Builder::experimental_attach`.
-    #[cfg(not(feature = "sync"))]
     pub fn experimental_attach(mut self, on: bool) -> Self {
         self.options.local_options.attach = on;
         self
@@ -420,7 +482,6 @@ impl Turso {
 
     /// Enable Turso's experimental custom types. Mirrors
     /// `turso::Builder::experimental_custom_types`.
-    #[cfg(not(feature = "sync"))]
     pub fn experimental_custom_types(mut self, on: bool) -> Self {
         self.options.local_options.custom_types = on;
         self
@@ -428,7 +489,6 @@ impl Turso {
 
     /// Enable Turso's experimental generated columns. Mirrors
     /// `turso::Builder::experimental_generated_columns`.
-    #[cfg(not(feature = "sync"))]
     pub fn experimental_generated_columns(mut self, on: bool) -> Self {
         self.options.local_options.generated_columns = on;
         self
@@ -436,7 +496,6 @@ impl Turso {
 
     /// Enable Turso's experimental materialized views. Mirrors
     /// `turso::Builder::experimental_materialized_views`.
-    #[cfg(not(feature = "sync"))]
     pub fn experimental_materialized_views(mut self, on: bool) -> Self {
         self.options.local_options.materialized_views = on;
         self
@@ -444,7 +503,6 @@ impl Turso {
 
     /// Enable Turso's experimental `VACUUM`. Mirrors
     /// `turso::Builder::experimental_vacuum`.
-    #[cfg(not(feature = "sync"))]
     pub fn experimental_vacuum(mut self, on: bool) -> Self {
         self.options.local_options.vacuum = on;
         self
@@ -452,7 +510,6 @@ impl Turso {
 
     /// Enable Turso's experimental multi-process WAL. Mirrors
     /// `turso::Builder::experimental_multiprocess_wal`.
-    #[cfg(not(feature = "sync"))]
     pub fn experimental_multiprocess_wal(mut self, on: bool) -> Self {
         self.options.local_options.multiprocess_wal = on;
         self
@@ -460,7 +517,6 @@ impl Turso {
 
     /// Enable Turso's experimental `WITHOUT ROWID` support. Mirrors
     /// `turso::Builder::experimental_without_rowid`.
-    #[cfg(not(feature = "sync"))]
     pub fn experimental_without_rowid(mut self, on: bool) -> Self {
         self.options.local_options.without_rowid = on;
         self
@@ -474,6 +530,7 @@ impl Turso {
     /// was previously synced, Turso loads the URL from on-disk metadata.
     #[cfg(feature = "sync")]
     pub fn with_remote_url(mut self, remote_url: impl Into<String>) -> Self {
+        self.sync_mode = true;
         self.options.sync_options.remote_url = Some(remote_url.into());
         self
     }
@@ -483,6 +540,10 @@ impl Turso {
     ///
     /// The token is sent as a `Bearer` header (without the prefix in this
     /// argument). Overridden by [`Self::with_auth_token_fn`] if called later.
+    ///
+    /// A token is a credential, not a mode request: it does not select the
+    /// sync engine by itself. Configuring a token on a driver that opens a
+    /// plain local database is rejected when the database opens.
     #[cfg(feature = "sync")]
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
         let token = token.into();
@@ -519,6 +580,7 @@ impl Turso {
     /// Defaults to `turso-sync-rust` when unset.
     #[cfg(feature = "sync")]
     pub fn with_client_name(mut self, name: impl Into<String>) -> Self {
+        self.sync_mode = true;
         self.options.sync_options.client_name = Some(name.into());
         self
     }
@@ -527,6 +589,7 @@ impl Turso {
     /// `turso::sync::Builder::with_long_poll_timeout`.
     #[cfg(feature = "sync")]
     pub fn with_long_poll_timeout(mut self, timeout: Duration) -> Self {
+        self.sync_mode = true;
         self.options.sync_options.long_poll_timeout = Some(timeout);
         self
     }
@@ -535,6 +598,9 @@ impl Turso {
     /// Cloud database. Mirrors `turso::sync::Builder::with_remote_encryption`.
     ///
     /// The cipher determines `reserved_bytes` for page layout during bootstrap.
+    ///
+    /// Like [`Self::with_auth_token`], the key is a credential, not a mode
+    /// request.
     #[cfg(feature = "sync")]
     pub fn with_remote_encryption(
         mut self,
@@ -569,6 +635,7 @@ impl Turso {
     /// attaching to an existing local file).
     #[cfg(feature = "sync")]
     pub fn bootstrap_if_empty(mut self, enable: bool) -> Self {
+        self.sync_mode = true;
         self.options.sync_options.bootstrap_if_empty = enable;
         self
     }
@@ -577,6 +644,7 @@ impl Turso {
     /// `turso::sync::Builder::with_partial_sync_opts_experimental`.
     #[cfg(feature = "sync")]
     pub fn experimental_with_partial_sync_opts(mut self, opts: PartialSyncOpts) -> Self {
+        self.sync_mode = true;
         self.options.sync_options.partial_sync_config_experimental = Some(opts);
         self
     }
@@ -588,7 +656,7 @@ impl Turso {
     /// so all connections in the pool see the same pending changes.
     #[cfg(feature = "sync")]
     pub async fn push(&self) -> Result<()> {
-        self.database()
+        self.sync_database()
             .await?
             .push()
             .await
@@ -602,7 +670,7 @@ impl Turso {
     /// when changes were applied, `false` when the remote had nothing new.
     #[cfg(feature = "sync")]
     pub async fn pull(&self) -> Result<bool> {
-        self.database()
+        self.sync_database()
             .await?
             .pull()
             .await
@@ -613,7 +681,7 @@ impl Turso {
     /// [`turso::sync::Database::checkpoint`].
     #[cfg(feature = "sync")]
     pub async fn checkpoint(&self) -> Result<()> {
-        self.database()
+        self.sync_database()
             .await?
             .checkpoint()
             .await
@@ -624,7 +692,7 @@ impl Turso {
     /// [`turso::sync::Database::stats`].
     #[cfg(feature = "sync")]
     pub async fn stats(&self) -> Result<DatabaseSyncStats> {
-        self.database()
+        self.sync_database()
             .await?
             .stats()
             .await
@@ -638,26 +706,73 @@ impl Turso {
         }
     }
 
-    /// Returns the cached `turso::Database`, opening it on first use.
+    /// Returns the cached database handle, opening it on first use.
     ///
     /// All connections handed out by [`Driver::connect`] go through the
     /// same `Database` so that `:memory:` is genuinely shared across pool
     /// slots (each `Builder::new_local(":memory:").build()` would otherwise
     /// produce a fresh, empty database).
-    async fn database(&self) -> Result<Database> {
+    async fn database(&self) -> Result<AnyDatabase> {
         let mut slot = self.database.lock().await;
         if let Some(db) = slot.as_ref() {
             return Ok(db.clone());
         }
 
-        #[cfg(not(feature = "sync"))]
-        let builder = self.options.apply(Builder::new_local(self.path_str()));
-        #[cfg(feature = "sync")]
-        let builder = self.options.apply(Builder::new_remote(self.path_str()));
+        let db = if self.is_sync() {
+            #[cfg(feature = "sync")]
+            {
+                // The sync engine has no counterpart for the local
+                // experimental toggles; reject the combination instead of
+                // silently dropping options.
+                if self.options.local_options.any_set() {
+                    return Err(toasty_core::Error::unsupported_feature(
+                        "local experimental options are not supported when the driver \
+                         is configured for sync",
+                    ));
+                }
+                let builder = self
+                    .options
+                    .apply_sync(SyncBuilder::new_remote(self.path_str()));
+                AnyDatabase::Sync(builder.build().await.map_err(classify_turso_error)?)
+            }
+            #[cfg(not(feature = "sync"))]
+            unreachable!("is_sync() is false without the `sync` feature")
+        } else {
+            // A credential (auth token, remote encryption key) is not a
+            // mode request, so it never selects an engine — but a
+            // credential on a plain local database is a configuration
+            // error, not something to drop silently.
+            #[cfg(feature = "sync")]
+            if self.options.sync_options.auth_token.is_some()
+                || self.options.sync_options.remote_encryption_key.is_some()
+            {
+                return Err(toasty_core::Error::unsupported_feature(
+                    "a remote credential (auth token or encryption key) is configured \
+                     but the driver opens a plain local database; add with_remote_url() \
+                     or with_sync() to sync",
+                ));
+            }
+            let builder = self
+                .options
+                .apply_local(Builder::new_local(self.path_str()));
+            AnyDatabase::Local(builder.build().await.map_err(classify_turso_error)?)
+        };
 
-        let db = builder.build().await.map_err(classify_turso_error)?;
         *slot = Some(db.clone());
         Ok(db)
+    }
+
+    /// Returns the sync engine handle for the sync-only operations
+    /// ([`Self::push`], [`Self::pull`], ...). Errors when the driver is
+    /// not configured for sync.
+    #[cfg(feature = "sync")]
+    async fn sync_database(&self) -> Result<SyncDatabase> {
+        match self.database().await? {
+            AnyDatabase::Sync(db) => Ok(db),
+            AnyDatabase::Local(_) => Err(toasty_core::Error::unsupported_feature(
+                "the driver is not configured for sync; call with_remote_url() or with_sync()",
+            )),
+        }
     }
 }
 
@@ -685,12 +800,11 @@ impl Driver for Turso {
     }
 
     async fn connect(&self, cx: &ConnectContext) -> Result<Box<dyn toasty_core::Connection>> {
-        let db = self.database().await?;
-
-        #[cfg(not(feature = "sync"))]
-        let conn = db.connect().map_err(classify_turso_error)?;
-        #[cfg(feature = "sync")]
-        let conn = db.connect().await.map_err(classify_turso_error)?;
+        let conn = match self.database().await? {
+            AnyDatabase::Local(db) => db.connect().map_err(classify_turso_error)?,
+            #[cfg(feature = "sync")]
+            AnyDatabase::Sync(db) => db.connect().await.map_err(classify_turso_error)?,
+        };
 
         if self.concurrent_writes {
             // `PRAGMA journal_mode = ...` returns the new mode as a row; the
@@ -996,6 +1110,60 @@ impl toasty_core::driver::Connection for Connection {
     }
 }
 
+/// The driver's engine is selected by configuration, not by the `sync`
+/// cargo feature: unconfigured drivers stay local, and any sync option
+/// (or `with_sync()`) flips to the sync engine.
+#[cfg(all(test, feature = "sync"))]
+mod sync_mode_tests {
+    use super::Turso;
+
+    #[test]
+    fn unconfigured_driver_stays_local() {
+        assert!(!Turso::in_memory().is_sync());
+        assert!(!Turso::file("/tmp/db").is_sync());
+        assert!(!Turso::file("/tmp/db").concurrent_writes().is_sync());
+        assert!(!Turso::file("/tmp/db").experimental_attach(true).is_sync());
+    }
+
+    #[test]
+    fn sync_options_imply_sync_mode() {
+        assert!(Turso::file("/tmp/db").with_sync().is_sync());
+        assert!(Turso::file("/tmp/db").with_remote_url("http://x").is_sync());
+        assert!(Turso::file("/tmp/db").with_client_name("c").is_sync());
+    }
+
+    /// A credential (auth token, remote encryption key) is not a mode
+    /// request: it selects nothing by itself, and a credential the
+    /// selected engine cannot use is rejected when the database opens.
+    #[tokio::test]
+    async fn credentials_do_not_imply_sync_mode() {
+        let driver = Turso::file("/tmp/db").with_auth_token("t");
+        assert!(!driver.is_sync());
+        assert!(
+            driver.database().await.is_err(),
+            "a token on a plain local database must be rejected"
+        );
+
+        let driver = Turso::file("/tmp/db").with_remote_encryption_key("a2V5");
+        assert!(!driver.is_sync());
+        assert!(
+            driver.database().await.is_err(),
+            "an encryption key on a plain local database must be rejected"
+        );
+    }
+
+    /// Local experimental options have no sync-engine counterpart; the
+    /// combination is rejected when the database is opened.
+    #[tokio::test]
+    async fn local_options_with_sync_mode_are_rejected() {
+        let driver = Turso::in_memory().experimental_attach(true).with_sync();
+        assert!(
+            driver.database().await.is_err(),
+            "local experimental options must be rejected in sync mode"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "sync"))]
 mod sync_tests {
     use super::{Turso, TursoValue};
@@ -1021,7 +1189,7 @@ mod sync_tests {
                     break;
                 }
                 if Instant::now() >= deadline {
-                    panic!("Turso sync server did not become ready within 30s; url={db_url}");
+                    panic!("Turso sync server did not become ready within 5s; url={db_url}");
                 }
                 sleep(Duration::from_millis(100)).await;
             }
@@ -1065,7 +1233,13 @@ mod sync_tests {
         server.run_sql("DROP TABLE IF EXISTS t").await;
 
         let driver = Turso::in_memory().with_remote_url(&server.db_url);
-        let conn = driver.database().await.unwrap().connect().await.unwrap();
+        let conn = driver
+            .sync_database()
+            .await
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
 
         conn.execute("DROP TABLE IF EXISTS t", ()).await.unwrap();
         conn.execute("CREATE TABLE t (x TEXT)", ()).await.unwrap();
@@ -1099,12 +1273,24 @@ mod sync_tests {
         assert_eq!(values, vec!["test", "test-2", "test-3"]);
     }
 
+    /// With the `sync` feature enabled but no sync option configured, the
+    /// driver must open the plain local engine — enabling the feature is
+    /// not supposed to change behavior.
     #[tokio::test]
     async fn test_local_db_without_remote_url() {
-        let server = TursoTestServer::new().await;
-        server.run_sql("DROP TABLE IF EXISTS t").await;
-
         let driver = Turso::in_memory();
-        let _ = driver.database().await.unwrap().connect().await.unwrap();
+        match driver.database().await.unwrap() {
+            super::AnyDatabase::Local(db) => {
+                db.connect().unwrap();
+            }
+            super::AnyDatabase::Sync(_) => {
+                panic!("an unconfigured driver must open the local engine")
+            }
+        }
+
+        assert!(
+            driver.sync_database().await.is_err(),
+            "sync operations must be rejected when the driver is not configured for sync"
+        );
     }
 }

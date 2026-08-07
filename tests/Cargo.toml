@@ -16,6 +16,7 @@ default = ["sqlite"]
 sql = ["sqlite", "mysql", "postgresql"]
 sqlite = ["toasty/sqlite", "dep:toasty-driver-sqlite"]
 turso = ["toasty/turso", "dep:toasty-driver-turso"]
+turso-sync = ["turso", "toasty/turso-sync"]
 mysql = [
     "toasty/mysql",
     "dep:toasty-driver-mysql",
