@@ -1484,6 +1484,97 @@ mod serverless_tests {
     }
 }
 
+/// With both the `sync` and `serverless` features enabled, the three
+/// engines coexist and the driver's configuration picks exactly one:
+/// the connection URL's shape selects serverless, sync options select
+/// the sync engine, and an unconfigured driver stays local.
+#[cfg(all(test, feature = "sync", feature = "serverless"))]
+mod combined_mode_tests {
+    use super::{AnyDatabase, Turso};
+
+    fn remote() -> Turso {
+        Turso::new("turso://my-db.aws-us-east-1.turso.io").unwrap()
+    }
+
+    /// A remote (serverless) URL wins over sync mode: `with_auth_token`
+    /// implies sync for file-backed databases, but against a Turso Cloud
+    /// URL the token is a serverless credential, not a request to sync.
+    #[tokio::test]
+    async fn remote_url_with_auth_token_is_serverless() {
+        let driver = remote().with_auth_token("token");
+        assert!(!driver.is_sync());
+
+        // Building a serverless handle performs no network I/O.
+        assert!(matches!(
+            driver.database().await.unwrap(),
+            AnyDatabase::Serverless(_)
+        ));
+    }
+
+    /// Sync replicates a local file; pointing a sync-configured driver at
+    /// a remote (serverless) URL is contradictory and rejected, not
+    /// resolved by precedence.
+    #[tokio::test]
+    async fn sync_options_with_remote_url_are_rejected() {
+        let driver = remote().with_sync();
+        assert!(
+            driver.database().await.is_err(),
+            "sync mode against a serverless URL must be rejected"
+        );
+
+        let driver = remote().with_remote_url("http://elsewhere");
+        assert!(
+            driver.database().await.is_err(),
+            "with_remote_url against a serverless URL must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_driver_is_local() {
+        assert!(matches!(
+            Turso::in_memory().database().await.unwrap(),
+            AnyDatabase::Local(_)
+        ));
+    }
+
+    /// The rotating-token callback follows the same credential rules as
+    /// the static token (see `sync_mode_tests`): here it must feed the
+    /// serverless engine, not select sync.
+    #[tokio::test]
+    async fn auth_token_fn_is_a_shared_credential() {
+        let serverless = remote().with_auth_token_fn(|| async { Ok("tok".to_string()) });
+        assert!(!serverless.is_sync());
+        assert!(matches!(
+            serverless.database().await.unwrap(),
+            AnyDatabase::Serverless(_)
+        ));
+    }
+
+    /// A remote encryption key against a serverless URL is a serverless
+    /// credential (sent as the `x-turso-encryption-key` header), not a
+    /// sync request.
+    #[tokio::test]
+    async fn remote_encryption_key_passes_through_for_serverless() {
+        let driver = remote().with_remote_encryption_key("a2V5");
+        assert!(!driver.is_sync(), "an encryption key is not a mode request");
+        assert!(
+            matches!(driver.database().await.unwrap(), AnyDatabase::Serverless(_)),
+            "the key must ride along to the serverless engine"
+        );
+    }
+
+    /// Sync operations must be rejected for a serverless database even
+    /// when the `sync` feature is compiled in.
+    #[tokio::test]
+    async fn sync_operations_rejected_for_serverless() {
+        let driver = remote().with_auth_token("token");
+        assert!(
+            driver.sync_database().await.is_err(),
+            "a serverless database has no local replica to sync"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "sync"))]
 mod sync_tests {
     use super::{Turso, TursoValue};
