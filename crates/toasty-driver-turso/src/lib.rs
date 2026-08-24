@@ -17,6 +17,11 @@
 //! an unconfigured driver always opens the plain local engine, feature or
 //! not.
 //!
+//! With the `serverless` feature, the driver also connects to a remote
+//! Turso Cloud database over HTTP via the [`turso_serverless`] crate. A
+//! connection URL with a host selects serverless mode; a URL with only a
+//! path (or `:memory:`) selects the embedded engine.
+//!
 //! [toasty-driver-sqlite]: https://docs.rs/toasty-driver-sqlite
 //!
 //! # Examples
@@ -33,10 +38,20 @@
 //! // Allow transactions to run concurrently instead of serializing writers
 //! let driver = Turso::file("path/to/db").concurrent_writes();
 //! ```
+//!
+//! ```rust,ignore
+//! // Turso Cloud over HTTP (requires the `serverless` feature)
+//! let driver = Turso::new("turso://my-db.aws-us-east-1.turso.io")?
+//!     .with_auth_token("<token>");
+//! ```
 
+mod conn;
 mod error;
 mod value;
 
+use conn::AnyConn;
+#[cfg(feature = "serverless")]
+use error::classify_serverless_error;
 use error::classify_turso_error;
 
 /// Encryption configuration for Turso. Re-exported from the upstream
@@ -49,10 +64,9 @@ pub use turso::sync::{
 };
 
 use async_trait::async_trait;
-#[cfg(feature = "sync")]
+#[cfg(any(feature = "sync", feature = "serverless"))]
 use std::future::Future;
-#[cfg(feature = "sync")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     borrow::Cow,
     fmt,
@@ -76,7 +90,7 @@ use toasty_sql::{self as sql};
 use tokio::sync::Mutex;
 #[cfg(feature = "sync")]
 use turso::sync::{AuthTokenFn, Builder as SyncBuilder, Database as SyncDatabase};
-use turso::{Builder, Connection as TursoConn, Database, Statement, Value as TursoValue};
+use turso::{Builder, Database, Value as TursoValue};
 
 enum SqlReturn {
     Count,
@@ -107,10 +121,55 @@ fn create_table_stmts(schema: &db::Schema, table: &Table) -> Vec<String> {
     stmts
 }
 
+/// Retries an operation while the database reports a retryable
+/// conflict (busy write lock, serialization failure).
+///
+/// A lock-taking `BEGIN` fails fast with "busy" while contended, and the
+/// serverless backend has no server-side busy timeout, so the wait
+/// happens here, with backoff. Retrying is safe for the two callers: a
+/// busy `BEGIN` acquired nothing, and a failed transactional batch is
+/// atomic — it leaves nothing applied on either transport.
+async fn retry_while_busy<T, F, Fut>(mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const RETRY_FOR: Duration = Duration::from_secs(10);
+
+    let deadline = Instant::now() + RETRY_FOR;
+    let mut delay = Duration::from_millis(10);
+    loop {
+        match op().await {
+            Err(err) if err.is_serialization_failure() && Instant::now() < deadline => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_millis(250));
+            }
+            res => return res,
+        }
+    }
+}
+
+async fn exec_ddl(
+    conn: &AnyConn,
+    statements: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<()> {
+    let stmts: Vec<(String, Vec<TursoValue>)> = statements
+        .into_iter()
+        .map(|sql| (sql.as_ref().to_string(), vec![]))
+        .collect();
+
+    retry_while_busy(|| conn.transactional_batch(&stmts)).await
+}
+
 #[derive(Debug, Clone)]
 enum TursoPath {
     File(PathBuf),
     InMemory,
+    /// A remote Turso Cloud database reached over HTTP ("serverless").
+    /// Holds the connection URL with any `authToken` query parameter
+    /// stripped.
+    #[cfg(feature = "serverless")]
+    Remote(String),
 }
 
 /// Driver builder options applied when opening a database.
@@ -125,6 +184,58 @@ struct BuilderOptions {
 
     #[cfg(feature = "sync")]
     sync_options: SyncBuilderOptions,
+
+    #[cfg(feature = "serverless")]
+    serverless_options: ServerlessBuilderOptions,
+}
+
+/// Options for a remote ("serverless") database, applied when the driver
+/// constructs a [`turso_serverless::Builder`].
+#[cfg(feature = "serverless")]
+#[derive(Default, Clone)]
+struct ServerlessBuilderOptions {
+    auth_token: Option<String>,
+    /// Overrides `auth_token` when set, mirroring the sync engine's
+    /// precedence.
+    auth_token_fn: Option<turso_serverless::AuthTokenFn>,
+    remote_encryption_key: Option<String>,
+}
+
+#[cfg(feature = "serverless")]
+impl BuilderOptions {
+    fn apply_serverless(&self, mut b: turso_serverless::Builder) -> turso_serverless::Builder {
+        let opts = &self.serverless_options;
+        if let Some(token_fn) = &opts.auth_token_fn {
+            let token_fn = token_fn.clone();
+            b = b.with_auth_token_fn(move || token_fn());
+        } else if let Some(token) = &opts.auth_token {
+            b = b.with_auth_token(token.clone());
+        }
+        if let Some(key) = &opts.remote_encryption_key {
+            b = b.with_remote_encryption_key(key.clone());
+        }
+        b
+    }
+}
+
+#[cfg(feature = "serverless")]
+impl fmt::Debug for ServerlessBuilderOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerlessBuilderOptions")
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "auth_token_fn",
+                &self.auth_token_fn.as_ref().map(|_| "<callback>"),
+            )
+            .field(
+                "remote_encryption_key",
+                &self.remote_encryption_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl BuilderOptions {
@@ -155,8 +266,9 @@ struct LocalBuilderOptions {
 
 impl LocalBuilderOptions {
     /// Whether any local-engine option was configured. Used to reject
-    /// configurations that combine local-only options with sync mode.
-    #[cfg(feature = "sync")]
+    /// configurations that combine local-only options with a remote
+    /// engine (sync or serverless).
+    #[cfg(any(feature = "sync", feature = "serverless"))]
     fn any_set(&self) -> bool {
         self.encryption.is_some()
             || self.attach
@@ -355,13 +467,16 @@ pub struct Turso {
 }
 
 /// The engine behind a [`Turso`] driver, selected at runtime by the
-/// driver's configuration: the plain local engine, or (with the `sync`
-/// feature) the sync engine that replicates to a remote database.
+/// driver's configuration: the plain local engine, the sync engine that
+/// replicates to a remote database (`sync` feature), or a remote Turso
+/// Cloud database reached over HTTP (`serverless` feature).
 #[derive(Clone)]
 enum AnyDatabase {
     Local(Database),
     #[cfg(feature = "sync")]
     Sync(SyncDatabase),
+    #[cfg(feature = "serverless")]
+    Serverless(turso_serverless::Database),
 }
 
 impl Turso {
@@ -369,9 +484,25 @@ impl Turso {
     ///
     /// The URL scheme must be `turso` (e.g. `turso::memory:` or
     /// `turso:/path/to/db`).
+    ///
+    /// With the `serverless` feature, an authority-form URL with a host
+    /// selects a remote Turso Cloud database reached over HTTP:
+    /// `turso://my-db.turso.io` (the form `turso db show --url` prints).
+    /// The `libsql`, `https` and `http` schemes are also accepted for
+    /// remote URLs, and an `authToken` query parameter is honored as if
+    /// passed to [`Self::with_auth_token`] (and stripped from the URL the
+    /// driver stores and reports). Scheme-relative and path forms
+    /// (`turso:todos.db`, `turso:/path/to/db`) always name local files;
+    /// without the feature, authority form resolves to a file path as
+    /// well.
     pub fn new(url: impl Into<String>) -> Result<Self> {
         let url_str = url.into();
         let url = ConnectionUrl::parse(&url_str)?;
+
+        #[cfg(feature = "serverless")]
+        if let Some(driver) = Self::try_remote(&url) {
+            return Ok(driver);
+        }
 
         if !url.has_scheme("turso") {
             return Err(toasty_core::Error::invalid_connection_url(format!(
@@ -385,6 +516,35 @@ impl Turso {
         }
 
         Ok(Self::with_path(TursoPath::File(path)))
+    }
+
+    /// Builds a serverless driver when the connection URL names a remote
+    /// database: a remote scheme (`libsql`, `https`, `http`), or a
+    /// `turso` URL whose authority parses as a non-empty host. An
+    /// authority that is not host-shaped (for example `turso://:memory:`)
+    /// falls through to the file interpretation.
+    #[cfg(feature = "serverless")]
+    fn try_remote(url: &ConnectionUrl<'_>) -> Option<Self> {
+        let is_remote_scheme =
+            url.has_scheme("libsql") || url.has_scheme("https") || url.has_scheme("http");
+        let has_host = url.host().ok().flatten().is_some();
+        if !is_remote_scheme && !(url.has_scheme("turso") && has_host) {
+            return None;
+        }
+
+        let auth_token = url
+            .query_pairs()
+            .find(|(key, _)| key == "authToken")
+            .map(|(_, value)| value.into_owned());
+
+        let remote = url.as_str();
+        let remote = remote.split_once('?').map_or(remote, |(base, _)| base);
+
+        let mut driver = Self::with_path(TursoPath::Remote(remote.to_string()));
+        if let Some(token) = auth_token {
+            driver = driver.with_auth_token(token);
+        }
+        Some(driver)
     }
 
     /// Create an in-memory Turso database.
@@ -406,6 +566,28 @@ impl Turso {
             sync_mode: false,
             database: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Whether a remote credential (auth token or remote encryption key)
+    /// is configured, under any feature.
+    fn has_remote_credentials(&self) -> bool {
+        #[cfg(feature = "sync")]
+        if self.options.sync_options.auth_token.is_some()
+            || self.options.sync_options.remote_encryption_key.is_some()
+        {
+            return true;
+        }
+        #[cfg(feature = "serverless")]
+        if self.options.serverless_options.auth_token.is_some()
+            || self
+                .options
+                .serverless_options
+                .remote_encryption_key
+                .is_some()
+        {
+            return true;
+        }
+        false
     }
 
     /// Whether this driver opens the sync engine.
@@ -450,6 +632,10 @@ impl Turso {
     /// [`TransactionMode`](toasty_core::driver::operation::TransactionMode):
     /// `Deferred` falls back to plain `BEGIN`, while `Immediate` and
     /// `Exclusive` issue `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE` respectively.
+    ///
+    /// On a serverless (Turso Cloud) database this is a no-op: those
+    /// databases are MVCC-native and transactions already run under
+    /// `BEGIN CONCURRENT` by default.
     pub fn concurrent_writes(mut self) -> Self {
         self.concurrent_writes = true;
         self
@@ -535,42 +721,70 @@ impl Turso {
         self
     }
 
-    /// Set a static authorization token for sync HTTP requests. Mirrors
-    /// `turso::sync::Builder::with_auth_token`.
+    /// Set a static authorization token for remote HTTP requests — sync
+    /// requests with the `sync` feature, statement execution against Turso
+    /// Cloud with the `serverless` feature. Mirrors
+    /// `turso::sync::Builder::with_auth_token` and
+    /// `turso_serverless::Builder::with_auth_token`.
     ///
     /// The token is sent as a `Bearer` header (without the prefix in this
-    /// argument). Overridden by [`Self::with_auth_token_fn`] if called later.
+    /// argument). With the `sync` feature, overridden by
+    /// [`Self::with_auth_token_fn`] if called later.
     ///
-    /// A token is a credential, not a mode request: it does not select the
-    /// sync engine by itself. Configuring a token on a driver that opens a
+    /// A token is a credential, not a mode request: it does not select an
+    /// engine by itself. Configuring a token on a driver that opens a
     /// plain local database is rejected when the database opens.
-    #[cfg(feature = "sync")]
+    #[cfg(any(feature = "sync", feature = "serverless"))]
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
         let token = token.into();
-        self.options.sync_options.auth_token = Some(Arc::new(move || {
+        #[cfg(feature = "sync")]
+        {
             let token = token.clone();
-            Box::pin(async move { Ok(token) })
-        }));
+            self.options.sync_options.auth_token = Some(Arc::new(move || {
+                let token = token.clone();
+                Box::pin(async move { Ok(token) })
+            }));
+        }
+        #[cfg(feature = "serverless")]
+        {
+            self.options.serverless_options.auth_token = Some(token);
+        }
         self
     }
 
     /// Set an async callback that produces an auth token on demand. Mirrors
-    /// `turso::sync::Builder::with_auth_token_fn`.
+    /// `turso::sync::Builder::with_auth_token_fn` and
+    /// `turso_serverless::Builder::with_auth_token_fn`.
     ///
     /// The callback runs before every HTTP request, so it can return a freshly
     /// rotated token (for example from a secrets manager or OAuth refresh). If
-    /// the callback returns an error, the in-flight sync operation fails with
+    /// the callback returns an error, the in-flight operation fails with
     /// that error.
     ///
-    /// Overrides any previously configured static token from
-    /// [`Self::with_auth_token`].
-    #[cfg(feature = "sync")]
+    /// Like [`Self::with_auth_token`], the callback is a credential, not a
+    /// mode request. Overrides any previously configured static token.
+    #[cfg(any(feature = "sync", feature = "serverless"))]
     pub fn with_auth_token_fn<F, Fut>(mut self, f: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = turso::Result<String>> + Send + 'static,
     {
-        self.options.sync_options.auth_token = Some(Arc::new(move || Box::pin(f())));
+        let f = Arc::new(f);
+        #[cfg(feature = "sync")]
+        {
+            let f = f.clone();
+            self.options.sync_options.auth_token = Some(Arc::new(move || Box::pin(f())));
+        }
+        #[cfg(feature = "serverless")]
+        {
+            self.options.serverless_options.auth_token_fn = Some(Arc::new(move || {
+                let f = f.clone();
+                Box::pin(async move {
+                    f().await
+                        .map_err(|e| turso_serverless::Error::Error(e.to_string()))
+                })
+            }));
+        }
         self
     }
 
@@ -613,16 +827,29 @@ impl Turso {
         self
     }
 
-    /// Set a base64-encoded encryption key for the remote Turso Cloud database.
-    /// Mirrors `turso::sync::Builder::with_remote_encryption_key`.
+    /// Set a base64-encoded encryption key for the remote Turso Cloud
+    /// database. Mirrors `turso::sync::Builder::with_remote_encryption_key`
+    /// and `turso_serverless::Builder::with_remote_encryption_key`.
     ///
-    /// The key is sent as the `x-turso-encryption-key` header on sync HTTP
-    /// requests. For deferred sync without an initial bootstrap, prefer
-    /// [`Self::with_remote_encryption`] so the cipher is set for correct
-    /// `reserved_bytes` calculation.
-    #[cfg(feature = "sync")]
+    /// The key is sent as the `x-turso-encryption-key` header on remote
+    /// HTTP requests — sync requests with the `sync` feature, statement
+    /// execution with the `serverless` feature. For deferred sync without
+    /// an initial bootstrap, prefer [`Self::with_remote_encryption`] so the
+    /// cipher is set for correct `reserved_bytes` calculation.
+    ///
+    /// Like [`Self::with_auth_token`], the key is a credential, not a mode
+    /// request.
+    #[cfg(any(feature = "sync", feature = "serverless"))]
     pub fn with_remote_encryption_key(mut self, base64_key: impl Into<String>) -> Self {
-        self.options.sync_options.remote_encryption_key = Some(base64_key.into());
+        let base64_key = base64_key.into();
+        #[cfg(feature = "sync")]
+        {
+            self.options.sync_options.remote_encryption_key = Some(base64_key.clone());
+        }
+        #[cfg(feature = "serverless")]
+        {
+            self.options.serverless_options.remote_encryption_key = Some(base64_key);
+        }
         self
     }
 
@@ -703,6 +930,8 @@ impl Turso {
         match &self.path {
             TursoPath::File(p) => p.to_str().unwrap_or(":memory:"),
             TursoPath::InMemory => ":memory:",
+            #[cfg(feature = "serverless")]
+            TursoPath::Remote(url) => url,
         }
     }
 
@@ -718,44 +947,69 @@ impl Turso {
             return Ok(db.clone());
         }
 
-        let db = if self.is_sync() {
-            #[cfg(feature = "sync")]
-            {
-                // The sync engine has no counterpart for the local
-                // experimental toggles; reject the combination instead of
-                // silently dropping options.
-                if self.options.local_options.any_set() {
+        let db = match &self.path {
+            #[cfg(feature = "serverless")]
+            TursoPath::Remote(url) => {
+                // Sync replicates a local file against a remote; a
+                // serverless URL leaves no local file to replicate. The
+                // combination is contradictory, not something to resolve
+                // by precedence.
+                if self.is_sync() {
                     return Err(toasty_core::Error::unsupported_feature(
-                        "local experimental options are not supported when the driver \
-                         is configured for sync",
+                        "the driver is configured for sync but the connection URL names \
+                         a remote Turso Cloud database; sync replicates a local file — \
+                         use a file path with with_remote_url() instead",
+                    ));
+                }
+                if self.options.local_options.any_set() || self.options.index_method {
+                    return Err(toasty_core::Error::unsupported_feature(
+                        "local experimental options are not supported for a serverless \
+                         (remote HTTP) database",
                     ));
                 }
                 let builder = self
                     .options
-                    .apply_sync(SyncBuilder::new_remote(self.path_str()));
-                AnyDatabase::Sync(builder.build().await.map_err(classify_turso_error)?)
+                    .apply_serverless(turso_serverless::Builder::new_remote(url.clone()));
+                AnyDatabase::Serverless(builder.build().await.map_err(classify_serverless_error)?)
             }
-            #[cfg(not(feature = "sync"))]
-            unreachable!("is_sync() is false without the `sync` feature")
-        } else {
-            // A credential (auth token, remote encryption key) is not a
-            // mode request, so it never selects an engine — but a
-            // credential on a plain local database is a configuration
-            // error, not something to drop silently.
-            #[cfg(feature = "sync")]
-            if self.options.sync_options.auth_token.is_some()
-                || self.options.sync_options.remote_encryption_key.is_some()
-            {
-                return Err(toasty_core::Error::unsupported_feature(
-                    "a remote credential (auth token or encryption key) is configured \
-                     but the driver opens a plain local database; add with_remote_url() \
-                     or with_sync() to sync",
-                ));
+            _ if self.is_sync() => {
+                #[cfg(feature = "sync")]
+                {
+                    // The sync engine has no counterpart for the local
+                    // experimental toggles; reject the combination instead of
+                    // silently dropping options.
+                    if self.options.local_options.any_set() {
+                        return Err(toasty_core::Error::unsupported_feature(
+                            "local experimental options are not supported when the driver \
+                             is configured for sync",
+                        ));
+                    }
+                    let builder = self
+                        .options
+                        .apply_sync(SyncBuilder::new_remote(self.path_str()));
+                    AnyDatabase::Sync(builder.build().await.map_err(classify_turso_error)?)
+                }
+                #[cfg(not(feature = "sync"))]
+                unreachable!("is_sync() is false without the `sync` feature")
             }
-            let builder = self
-                .options
-                .apply_local(Builder::new_local(self.path_str()));
-            AnyDatabase::Local(builder.build().await.map_err(classify_turso_error)?)
+            _ => {
+                // A credential (auth token, remote encryption key) is not
+                // a mode request, so it never selects an engine — but a
+                // credential on a plain local database is a configuration
+                // error, not something to drop silently.
+                if self.has_remote_credentials() {
+                    return Err(toasty_core::Error::unsupported_feature(
+                        "a remote credential (auth token or encryption key) is \
+                         configured but the driver opens a plain local database; a \
+                         credential requires a sync remote (with_remote_url() or \
+                         with_sync()) or a Turso Cloud connection URL",
+                    ));
+                }
+                let builder = self
+                    .options
+                    .apply_local(Builder::new_local(self.path_str()));
+                AnyDatabase::Local(builder.build().await.map_err(classify_turso_error)?)
+            }
         };
 
         *slot = Some(db.clone());
@@ -764,13 +1018,18 @@ impl Turso {
 
     /// Returns the sync engine handle for the sync-only operations
     /// ([`Self::push`], [`Self::pull`], ...). Errors when the driver is
-    /// not configured for sync.
+    /// not configured for sync — including when it points at a serverless
+    /// (remote HTTP) database, which has no local replica to sync.
     #[cfg(feature = "sync")]
     async fn sync_database(&self) -> Result<SyncDatabase> {
         match self.database().await? {
             AnyDatabase::Sync(db) => Ok(db),
             AnyDatabase::Local(_) => Err(toasty_core::Error::unsupported_feature(
                 "the driver is not configured for sync; call with_remote_url() or with_sync()",
+            )),
+            #[cfg(feature = "serverless")]
+            AnyDatabase::Serverless(_) => Err(toasty_core::Error::unsupported_feature(
+                "sync operations are not available for a serverless (remote HTTP) database",
             )),
         }
     }
@@ -792,6 +1051,8 @@ impl Driver for Turso {
         match &self.path {
             TursoPath::InMemory => Cow::Borrowed("turso::memory:"),
             TursoPath::File(path) => Cow::Owned(format!("turso:{}", path.display())),
+            #[cfg(feature = "serverless")]
+            TursoPath::Remote(url) => Cow::Borrowed(url),
         }
     }
 
@@ -801,28 +1062,47 @@ impl Driver for Turso {
 
     async fn connect(&self, cx: &ConnectContext) -> Result<Box<dyn toasty_core::Connection>> {
         let conn = match self.database().await? {
-            AnyDatabase::Local(db) => db.connect().map_err(classify_turso_error)?,
+            AnyDatabase::Local(db) => {
+                AnyConn::Embedded(db.connect().map_err(classify_turso_error)?)
+            }
             #[cfg(feature = "sync")]
-            AnyDatabase::Sync(db) => db.connect().await.map_err(classify_turso_error)?,
+            AnyDatabase::Sync(db) => {
+                AnyConn::Embedded(db.connect().await.map_err(classify_turso_error)?)
+            }
+            #[cfg(feature = "serverless")]
+            AnyDatabase::Serverless(db) => {
+                AnyConn::Serverless(db.connect().map_err(classify_serverless_error)?)
+            }
         };
 
-        if self.concurrent_writes {
+        if self.concurrent_writes && !conn.is_serverless() {
             // `PRAGMA journal_mode = ...` returns the new mode as a row; the
             // `execute` path errors with "unexpected row during execution"
             // on any pragma that emits one. Use `pragma_update` so the row
             // is consumed.
-            conn.pragma_update("journal_mode", "'mvcc'")
-                .await
-                .map_err(classify_turso_error)?;
+            //
+            // Serverless databases skip the pragma: Turso Cloud databases
+            // created with `--tursodb` are MVCC-native and the backend
+            // rejects the statement ("SQL not allowed"); `BEGIN CONCURRENT`
+            // alone provides the concurrent-writes semantics there.
+            conn.pragma_update("journal_mode", "'mvcc'").await?;
         }
+
+        // Serverless databases are MVCC-native (Turso Cloud, created with
+        // `--tursodb`), so transactions default to `BEGIN CONCURRENT` —
+        // the same semantics `concurrent_writes()` opts into for the
+        // embedded engine, which makes that flag a no-op here. Callers can
+        // still choose classic locking per transaction with
+        // `TransactionMode::Deferred`/`Immediate`/`Exclusive`.
+        let default_begin_sql = if conn.is_serverless() || self.concurrent_writes {
+            "BEGIN CONCURRENT"
+        } else {
+            "BEGIN"
+        };
 
         Ok(Box::new(Connection {
             conn,
-            default_begin_sql: if self.concurrent_writes {
-                "BEGIN CONCURRENT"
-            } else {
-                "BEGIN"
-            },
+            default_begin_sql,
             query_log: cx.query_log,
         }))
     }
@@ -839,6 +1119,37 @@ impl Driver for Turso {
     }
 
     async fn reset_db(&self) -> Result<()> {
+        // There is no file to delete on a remote database; drop every user
+        // table instead (indexes and triggers go down with their table).
+        #[cfg(feature = "serverless")]
+        if let TursoPath::Remote(_) = &self.path {
+            let AnyDatabase::Serverless(db) = self.database().await? else {
+                unreachable!("a Remote path always opens a serverless database");
+            };
+            let conn = AnyConn::Serverless(db.connect().map_err(classify_serverless_error)?);
+
+            // `__turso_%` covers tursodb-internal system tables (e.g.
+            // `__turso_internal_mvcc_meta`), which cannot be dropped.
+            let mut rows = conn
+                .query(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type = 'table' \
+                       AND name NOT LIKE 'sqlite_%' \
+                       AND name NOT LIKE '\\_\\_turso\\_%' ESCAPE '\\'",
+                    vec![],
+                )
+                .await?;
+
+            let mut drops = vec![];
+            while let Some(row) = rows.next().await? {
+                if let TursoValue::Text(name) = row.get_value(0)? {
+                    drops.push(format!("DROP TABLE IF EXISTS \"{name}\""));
+                }
+            }
+
+            return exec_ddl(&conn, &drops).await;
+        }
+
         // Drop the cached Database so subsequent `connect()` calls open a
         // fresh one. For in-memory this is the only way to wipe state;
         // for file-backed databases the file is also removed below.
@@ -856,7 +1167,7 @@ impl Driver for Turso {
 
 /// An open connection to a Turso database.
 pub struct Connection {
-    conn: TursoConn,
+    conn: AnyConn,
     /// SQL to issue for [`TransactionMode::Default`]. Resolved by the
     /// driver at `connect()` time — either `"BEGIN"` for classic
     /// deferred locking, or `"BEGIN CONCURRENT"` when the driver was
@@ -905,52 +1216,38 @@ impl Connection {
             .map(|tv| value::to_turso(&tv.value))
             .collect();
 
-        let mut stmt: Statement = self
-            .conn
-            .prepare_cached(sql_str)
-            .await
-            .map_err(classify_turso_error)?;
+        let mut stmt = self.conn.prepare_cached(sql_str).await?;
 
         if matches!(ret, SqlReturn::Count) {
-            let count = stmt.execute(params).await.map_err(classify_turso_error)?;
+            let count = stmt.execute(params).await?;
 
             return Ok(ExecResponse::count(count as _));
         }
 
-        let mut rows = stmt.query(params).await.map_err(classify_turso_error)?;
+        let mut rows = stmt.query(params).await?;
 
         let mut values = vec![];
 
-        loop {
-            match rows.next().await {
-                Ok(Some(row)) => {
-                    let items = match &ret {
-                        SqlReturn::Count => unreachable!(),
-                        SqlReturn::Infer => {
-                            let mut items = vec![];
-                            for index in 0..row.column_count() {
-                                let turso_val =
-                                    row.get_value(index).map_err(classify_turso_error)?;
-                                items.push(value::from_turso_infer(turso_val));
-                            }
-                            items
-                        }
-                        SqlReturn::Types(ret_tys) => {
-                            let mut items = Vec::with_capacity(ret_tys.len());
-                            for (index, ret_ty) in ret_tys.iter().enumerate() {
-                                let turso_val =
-                                    row.get_value(index).map_err(classify_turso_error)?;
-                                items.push(value::from_turso(turso_val, ret_ty));
-                            }
-                            items
-                        }
-                    };
-
-                    values.push(stmt::ValueRecord::from_vec(items).into());
+        while let Some(row) = rows.next().await? {
+            let items = match &ret {
+                SqlReturn::Count => unreachable!(),
+                SqlReturn::Infer => {
+                    let mut items = vec![];
+                    for index in 0..row.column_count() {
+                        items.push(value::from_turso_infer(row.get_value(index)?));
+                    }
+                    items
                 }
-                Ok(None) => break,
-                Err(err) => return Err(classify_turso_error(err)),
-            }
+                SqlReturn::Types(ret_tys) => {
+                    let mut items = Vec::with_capacity(ret_tys.len());
+                    for (index, ret_ty) in ret_tys.iter().enumerate() {
+                        items.push(value::from_turso(row.get_value(index)?, ret_ty));
+                    }
+                    items
+                }
+            };
+
+            values.push(stmt::ValueRecord::from_vec(items).into());
         }
 
         log.rows(values.len() as u64);
@@ -991,10 +1288,18 @@ impl toasty_core::driver::Connection for Connection {
                 let sql_str =
                     sql::Serializer::sqlite_with_default_begin(&schema.db, self.default_begin_sql)
                         .serialize_transaction(&op);
-                self.conn
-                    .execute(&sql_str, ())
-                    .await
-                    .map_err(classify_turso_error)?;
+                // On serverless there is no server-side busy timeout, so a
+                // lock-taking BEGIN waits here instead of surfacing every
+                // transient conflict. Embedded connections keep fail-fast
+                // busy semantics.
+                if self.conn.is_serverless()
+                    && matches!(&op, Transaction::Start { .. })
+                    && sql_str.starts_with("BEGIN")
+                {
+                    retry_while_busy(|| self.conn.execute(&sql_str, vec![])).await?;
+                } else {
+                    self.conn.execute(&sql_str, vec![]).await?;
+                }
                 return Ok(ExecResponse::count(0));
             }
             _ => todo!("op={:#?}", op),
@@ -1011,44 +1316,32 @@ impl toasty_core::driver::Connection for Connection {
     }
 
     async fn push_schema(&mut self, schema: &Schema) -> Result<()> {
+        let mut statements = vec![];
         for table in &schema.db.tables {
             tracing::debug!(table = %table.name, "creating table");
-            for sql in create_table_stmts(&schema.db, table) {
-                self.conn
-                    .execute(&sql, ())
-                    .await
-                    .map_err(classify_turso_error)?;
-            }
+            statements.extend(create_table_stmts(&schema.db, table));
         }
 
-        Ok(())
+        exec_ddl(&self.conn, &statements).await
     }
 
     async fn applied_migrations(
         &mut self,
     ) -> Result<Vec<toasty_core::schema::db::AppliedMigration>> {
-        self.conn
-            .execute(CREATE_MIGRATIONS_TABLE, ())
-            .await
-            .map_err(classify_turso_error)?;
+        exec_ddl(&self.conn, [CREATE_MIGRATIONS_TABLE]).await?;
 
         let mut rows = self
             .conn
-            .query("SELECT id FROM __toasty_migrations ORDER BY applied_at", ())
-            .await
-            .map_err(classify_turso_error)?;
+            .query(
+                "SELECT id FROM __toasty_migrations ORDER BY applied_at",
+                vec![],
+            )
+            .await?;
 
         let mut migrations = vec![];
-        loop {
-            match rows.next().await {
-                Ok(Some(row)) => {
-                    let val = row.get_value(0).map_err(classify_turso_error)?;
-                    if let TursoValue::Integer(id) = val {
-                        migrations.push(toasty_core::schema::db::AppliedMigration::new(id as u64));
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => return Err(classify_turso_error(err)),
+        while let Some(row) = rows.next().await? {
+            if let TursoValue::Integer(id) = row.get_value(0)? {
+                migrations.push(toasty_core::schema::db::AppliedMigration::new(id as u64));
             }
         }
 
@@ -1063,50 +1356,24 @@ impl toasty_core::driver::Connection for Connection {
     ) -> Result<()> {
         tracing::info!(id = id, name = %name, "applying migration");
 
-        self.conn
-            .execute(CREATE_MIGRATIONS_TABLE, ())
-            .await
-            .map_err(classify_turso_error)?;
-
-        self.conn
-            .execute("BEGIN", ())
-            .await
-            .map_err(classify_turso_error)?;
-
+        // The whole migration — DDL plus the parameterized bookkeeping
+        // INSERT — is one atomic transactional batch: a single HTTP
+        // request on the serverless transport.
+        let mut stmts: Vec<(String, Vec<TursoValue>)> =
+            vec![(CREATE_MIGRATIONS_TABLE.to_string(), vec![])];
         for statement in migration.statements() {
-            if let Err(e) = self
-                .conn
-                .execute(statement, ())
-                .await
-                .map_err(classify_turso_error)
-            {
-                let _ = self.conn.execute("ROLLBACK", ()).await;
-                return Err(e);
-            }
+            stmts.push((statement.to_string(), vec![]));
         }
+        stmts.push((
+            "INSERT INTO __toasty_migrations (id, name, applied_at) VALUES (?1, ?2, datetime('now'))"
+                .to_string(),
+            vec![
+                TursoValue::Integer(id as i64),
+                TursoValue::Text(name.to_string()),
+            ],
+        ));
 
-        if let Err(e) = self
-            .conn
-            .execute(
-                "INSERT INTO __toasty_migrations (id, name, applied_at) VALUES (?1, ?2, datetime('now'))",
-                vec![
-                    TursoValue::Integer(id as i64),
-                    TursoValue::Text(name.to_string()),
-                ],
-            )
-            .await
-            .map_err(classify_turso_error)
-        {
-            let _ = self.conn.execute("ROLLBACK", ()).await;
-            return Err(e);
-        }
-
-        self.conn
-            .execute("COMMIT", ())
-            .await
-            .map_err(classify_turso_error)?;
-
-        Ok(())
+        retry_while_busy(|| self.conn.transactional_batch(&stmts)).await
     }
 }
 
@@ -1161,6 +1428,59 @@ mod sync_mode_tests {
             driver.database().await.is_err(),
             "local experimental options must be rejected in sync mode"
         );
+    }
+}
+
+#[cfg(all(test, feature = "serverless"))]
+mod serverless_tests {
+    use super::{Turso, TursoPath};
+
+    /// An authority-form URL with a host selects a remote Turso Cloud
+    /// database — the form `turso db show --url` prints. The `libsql`
+    /// scheme is accepted as an alias; host-less forms keep resolving to
+    /// local files.
+    #[test]
+    fn new_url_with_host_is_remote() {
+        let driver = Turso::new("turso://my-db.aws-us-east-1.turso.io").unwrap();
+        assert!(matches!(
+            &driver.path,
+            TursoPath::Remote(url) if url == "turso://my-db.aws-us-east-1.turso.io"
+        ));
+
+        let driver = Turso::new("libsql://my-db.aws-us-east-1.turso.io").unwrap();
+        assert!(matches!(
+            &driver.path,
+            TursoPath::Remote(url) if url == "libsql://my-db.aws-us-east-1.turso.io"
+        ));
+
+        // Scheme-relative and path forms always name local files.
+        assert!(matches!(
+            Turso::new("turso:todos.db").unwrap().path,
+            TursoPath::File(path) if path == std::path::Path::new("todos.db")
+        ));
+        assert!(matches!(
+            Turso::new("turso:///tmp/db.sqlite").unwrap().path,
+            TursoPath::File(_)
+        ));
+        assert!(matches!(
+            Turso::new("turso://:memory:").unwrap().path,
+            TursoPath::InMemory
+        ));
+    }
+
+    /// An `authToken` query parameter is applied as the auth token and
+    /// must never leak — not through [`Driver::url`], not through `Debug`.
+    #[test]
+    fn new_extracts_and_strips_auth_token() {
+        use toasty_core::driver::Driver;
+
+        let driver = Turso::new("turso://my-db.turso.io?authToken=sekrit").unwrap();
+        assert_eq!(driver.url(), "turso://my-db.turso.io");
+        assert_eq!(
+            driver.options.serverless_options.auth_token.as_deref(),
+            Some("sekrit")
+        );
+        assert!(!format!("{driver:?}").contains("sekrit"));
     }
 }
 
@@ -1283,9 +1603,7 @@ mod sync_tests {
             super::AnyDatabase::Local(db) => {
                 db.connect().unwrap();
             }
-            super::AnyDatabase::Sync(_) => {
-                panic!("an unconfigured driver must open the local engine")
-            }
+            _ => panic!("an unconfigured driver must open the local engine"),
         }
 
         assert!(
